@@ -1,4 +1,4 @@
-# Lethal Kernel
+# Lethal Kernel Alpha Version
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Architecture: x86_64](https://img.shields.io/badge/Architecture-x86__64-blue.svg)]()
