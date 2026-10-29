@@ -1,5 +1,8 @@
 ; ============================================================================
 ; Lethal Kernel - Multiboot2 entry point
+;
+; Copyright (c) 2026 Lethal Kernel contributors
+; SPDX-License-Identifier: MIT
 ; ============================================================================
 
 section .multiboot_header progbits alloc noexec nowrite align=8
@@ -37,17 +40,12 @@ extern __bss_end
 global kernel_stack_top
 
 _start:
-    ; Salva magic e info_addr in memoria (variabili .data)
     mov [saved_magic], eax
     mov [saved_info], ebx
 
-    ; Carica la nostra GDT (con selettore 64-bit a 0x08)
     lgdt [gdt_descriptor]
-
-    ; Stack temporaneo
     mov esp, stack32_top
 
-    ; Costruisci page table
     mov edi, 0x1000
     xor eax, eax
     mov ecx, (3 * 4096) / 4
@@ -69,27 +67,23 @@ _start:
     add edi, 8
     loop .fill_pd
 
-    ; PAE
     mov eax, cr4
     or eax, 1 << 5
     mov cr4, eax
 
-    ; CR3
     mov eax, 0x1000
     mov cr3, eax
 
-    ; EFER.LME
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 1 << 8
+    or eax, (1 << 8)       ; EFER.LME
+    or eax, (1 << 11)      ; EFER.NXE
     wrmsr
 
-    ; CR0.PG
     mov eax, cr0
     or eax, 1 << 31
     mov cr0, eax
 
-    ; Salta in long mode
     jmp 0x08:long_mode_entry
 
 ; ---------------------------------------------------------------------------
@@ -106,18 +100,16 @@ long_mode_entry:
 
     mov rsp, kernel_stack_top
 
-    ; --- Abilita SSE (necessario per stb_truetype e math.c) ---
     mov rax, cr0
-    and rax, ~(1 << 2)      ; CR0.EM = 0 (disabilita emulazione FPU)
-    or  rax, (1 << 1)       ; CR0.MP = 1 (monitor coprocessore)
+    and rax, ~(1 << 2)
+    or  rax, (1 << 1)
     mov cr0, rax
 
     mov rax, cr4
-    or  rax, (1 << 9)       ; CR4.OSFXSR = 1 (abilita SSE)
-    or  rax, (1 << 10)      ; CR4.OSXMMEXCPT = 1 (abilita eccezioni SSE)
+    or  rax, (1 << 9)
+    or  rax, (1 << 10)
     mov cr4, rax
 
-    ; Zero .bss
     mov rdi, __bss_start
     mov rcx, __bss_end
     sub rcx, rdi
@@ -125,7 +117,6 @@ long_mode_entry:
     cld
     rep stosb
 
-    ; Ricarica magic e info_addr dalla memoria
     mov edi, [saved_magic]
     mov esi, [saved_info]
     call kernel_main
@@ -151,7 +142,7 @@ gdt_descriptor:
     dd gdt_start
 
 ; ---------------------------------------------------------------------------
-; Variabili salvate
+; Saved multiboot registers
 ; ---------------------------------------------------------------------------
 section .data
 align 8
@@ -161,7 +152,11 @@ saved_info:
     dd 0
 
 ; ---------------------------------------------------------------------------
-; Stack
+; Stacks
+;
+; A guard page is placed immediately below the kernel stack so that
+; an overflow causes a page fault instead of silently corrupting .bss.
+; The guard page is NOT mapped by the VMM, so any access to it faults.
 ; ---------------------------------------------------------------------------
 section .bss
 align 16
@@ -169,7 +164,15 @@ stack32_bottom:
     resb 4096
 stack32_top:
 
-align 16
+align 4096
+global kernel_stack_guard_start
+global kernel_stack_guard_end
+global kernel_stack_bottom
+global kernel_stack_top
+
+kernel_stack_guard_start:
+    resb 4096
+kernel_stack_guard_end:
 kernel_stack_bottom:
     resb 16384
 kernel_stack_top:

@@ -20,14 +20,6 @@ FS_IMAGE := $(BUILD)/fs.img
 FAT_TOOL := tools/mkfat16.py
 
 FONT_FILE      := third_party/fonts/Inter-Regular.ttf
-WALLPAPER_FILE := third_party/wallpapers/wallpaper.png
-
-ICONS_DIR := third_party/icons_ready
-
-ICON_TERMINAL := $(ICONS_DIR)/TERMINAL.PNG
-ICON_FILES    := $(ICONS_DIR)/FILES.PNG
-ICON_SETTINGS := $(ICONS_DIR)/SETTINGS.PNG
-ICONS_OUT     := $(ICON_TERMINAL) $(ICON_FILES) $(ICON_SETTINGS)
 
 # ----------------------------------------------------------------------------
 # QEMU display options
@@ -65,7 +57,7 @@ LDFLAGS := -m elf_x86_64 -T linker.ld -nostdlib -static -no-pie
 # Phony targets
 # ----------------------------------------------------------------------------
 .PHONY: all kernel clean clean-all run run-fast run-smp run-gdb run-net \
-        test test-net test-all fsimage icons toolcheck help
+        test test-net test-all fsimage toolcheck help
 
 # ----------------------------------------------------------------------------
 # Default target
@@ -168,25 +160,13 @@ $(BUILD)/user/ipc_test.bin: user/ipc_test.asm user/lib.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f bin -I user/ $< -o $@
 
-icons: $(ICONS_OUT)
-	@echo "Icons OK:"
-	@ls -la $(ICONS_OUT)
-
-$(ICONS_OUT):
-	@echo "ERROR: missing file $@"
-	@echo "Place the pre-resized icons in $(ICONS_DIR)/ using these filenames:"
-	@echo "  TERMINAL.PNG  FILES.PNG  SETTINGS.PNG (uppercase)"
-	@exit 1
-
-fsimage: $(USER_BINS) $(FAT_TOOL) $(FONT_FILE) $(WALLPAPER_FILE) $(ICONS_OUT)
+fsimage: $(USER_BINS) $(FAT_TOOL) $(FONT_FILE)
 	@mkdir -p $(BUILD)
 	@echo "Creating FAT16 image..."
 	$(PYTHON) $(FAT_TOOL) $(FS_IMAGE) \
 		$(BUILD)/user/init.bin \
 		$(BUILD)/user/ipc_test.bin \
-		$(FONT_FILE) \
-		$(WALLPAPER_FILE) \
-		$(ICONS_OUT)
+		$(FONT_FILE)
 
 # ----------------------------------------------------------------------------
 # ISO image
@@ -265,16 +245,10 @@ help:
 	@echo "  make run-smp        - Same as run, but with 2 CPUs"
 	@echo "  make run-net        - Same as run, but with an e1000 network interface"
 	@echo "  make run-gdb        - Same as run, but with the GDB stub enabled (-s -S)"
-	@echo "  make fsimage        - Build only the FAT16 filesystem image (with PNG icons)"
-	@echo "  make icons          - Check that all 3 icons exist in $(ICONS_DIR)/"
+	@echo "  make fsimage        - Build only the FAT16 filesystem image"
 	@echo "  make clean          - Clean the build/ directory"
 	@echo "  make clean-all      - Remove all build artifacts"
 	@echo "  make help           - Display this help message"
-	@echo ""
-	@echo "  Icons (pre-resized, uppercase filenames):"
-	@echo "         $(ICONS_DIR)/TERMINAL.PNG"
-	@echo "         $(ICONS_DIR)/FILES.PNG"
-	@echo "         $(ICONS_DIR)/SETTINGS.PNG"
 	@echo ""
 	@echo "  GUI and LVGL are disabled by default."
 	@echo "  To re-enable them, uncomment the lines marked in the Makefile."

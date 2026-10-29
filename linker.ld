@@ -1,6 +1,8 @@
 /*
  * Lethal Kernel - linker script
- * Kernel is loaded at physical/virtual 1 MiB and uses identity mapping.
+ *
+ * Copyright (c) 2026 Lethal Kernel contributors
+ * SPDX-License-Identifier: MIT
  */
 ENTRY(_start)
 
@@ -10,28 +12,30 @@ SECTIONS
 
     _kernel_start = .;
 
-    /* Multiboot2 header must be within the first 32 KiB of the file and
-     * 8-byte aligned, so it goes before anything else and is KEEP()ed
-     * (otherwise the linker may garbage-collect it since nothing references it).
-     */
     .multiboot_header ALIGN(8) : {
         KEEP(*(.multiboot_header))
     }
 
     .text ALIGN(4096) : {
+        _text_start = .;
         *(.text.entry)
         *(.text)
         *(.text.*)
+        _text_end = .;
     }
 
     .rodata ALIGN(4096) : {
+        _rodata_start = .;
         *(.rodata)
         *(.rodata.*)
+        _rodata_end = .;
     }
 
     .data ALIGN(4096) : {
+        _data_start = .;
         *(.data)
         *(.data.*)
+        _data_end = .;
     }
 
     .bss ALIGN(4096) : {

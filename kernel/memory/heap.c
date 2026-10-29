@@ -1,13 +1,6 @@
 /*
  * Lethal Kernel - kernel heap (kmalloc/kfree)
  *
- * A first-fit freelist allocator over a region of virtual memory that is
- * mapped page-by-page (via the VMM, backed by PMM frames) as the heap
- * grows. Each allocation is prefixed by a small header carrying its size
- * and free/used state, and free blocks are kept in a doubly linked list
- * with adjacent-block coalescing on free() to fight fragmentation.
- *
- *
  * Copyright (c) 2026 Lethal Kernel contributors
  * SPDX-License-Identifier: MIT
  */
@@ -23,7 +16,7 @@
 struct block_header {
     uint32_t magic;
     uint32_t is_free;
-    size_t   size;              /* usable size, excluding this header */
+    size_t   size;
     struct block_header *next;
     struct block_header *prev;
 };
@@ -32,12 +25,11 @@ struct block_header {
 #define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
 static uint64_t heap_start;
-static uint64_t heap_end;       /* current mapped end (exclusive) */
-static uint64_t heap_max;       /* hard ceiling, never mapped past this */
+static uint64_t heap_end;
+static uint64_t heap_max;
 static struct block_header *free_list;
 static uint64_t used_bytes;
 static int corrupt_reports = 0;
-
 
 static int block_ok(const struct block_header *b)
 {
@@ -53,34 +45,6 @@ static void report_corrupt(const struct block_header *b)
     corrupt_reports++;
     serial_print("[heap] CORRUPT block=");
     serial_print_hex((uint64_t)(uintptr_t)b);
-    serial_print(" magic=");
-    serial_print_hex(b->magic);
-    serial_print(" free=");
-    serial_print_dec(b->is_free);
-    serial_print(" size=");
-    serial_print_hex((uint64_t)b->size);
-    serial_print(" next=");
-    serial_print_hex((uint64_t)(uintptr_t)b->next);
-    serial_print(" expected_end=");
-    serial_print_hex((uint64_t)(uintptr_t)b + HEADER_SIZE + b->size);
-    serial_print("\n");
-}
-
-
-static void trace_big(const char *what, const struct block_header *b, size_t req)
-{
-    serial_print("[heap] ");
-    serial_print(what);
-    serial_print(" req=");
-    serial_print_dec(req);
-    serial_print(" blk=");
-    serial_print_hex((uint64_t)(uintptr_t)b);
-    serial_print(" size=");
-    serial_print_dec((uint64_t)b->size);
-    serial_print(" next=");
-    serial_print_hex((uint64_t)(uintptr_t)b->next);
-    serial_print(" prev=");
-    serial_print_hex((uint64_t)(uintptr_t)b->prev);
     serial_print("\n");
 }
 
@@ -90,13 +54,13 @@ static int heap_grow(size_t min_extra)
     uint64_t new_end = heap_end + needed;
 
     if (new_end > heap_max) {
-        return -1; 
+        return -1;
     }
 
     for (uint64_t addr = heap_end; addr < new_end; addr += PAGE_SIZE) {
         uint64_t frame = pmm_alloc_frame();
         if (frame == 0) {
-            return -1; /* out of physical memory */
+            return -1;
         }
         if (vmm_map_page(addr, frame, PTE_WRITE) != 0) {
             pmm_free_frame(frame);
@@ -150,7 +114,7 @@ static void split_block(struct block_header *block, size_t size)
 {
     size_t remaining = block->size - size;
     if (remaining <= HEADER_SIZE + 16) {
-        return; /* not worth splitting */
+        return;
     }
 
     struct block_header *new_block =
@@ -170,50 +134,31 @@ static void split_block(struct block_header *block, size_t size)
 
 void *kmalloc(size_t size)
 {
-    if (size == 0) {
-        return NULL;
-    }
+    if (size == 0) return NULL;
     size = ALIGN_UP(size, 16);
 
     struct block_header *block = free_list;
     while (block) {
         if (block->magic != HEAP_MAGIC) {
-
             report_corrupt(block);
             break;
         }
         if (block->is_free && block->size >= size) {
             if (!block_ok(block)) {
-
                 report_corrupt(block);
                 block = block->next;
                 continue;
             }
-            size_t bsize_before = block->size;
             split_block(block, size);
             block->is_free = 0;
             used_bytes += block->size;
-            if (size >= 65536) {
-                serial_print("[heap] bsize_before=");
-                serial_print_dec((uint64_t)bsize_before);
-                serial_print(" ");
-                trace_big("ALLOC", block, size);
-            }
             return (void *)((uint8_t *)block + HEADER_SIZE);
         }
         block = block->next;
     }
 
-
-    if (size >= 65536) {
-        serial_print("[heap] GROW for req=");
-        serial_print_dec(size);
-        serial_print(" heap_end=");
-        serial_print_hex(heap_end);
-        serial_print("\n");
-    }
     if (heap_grow(size + HEADER_SIZE) != 0) {
-        return NULL; 
+        return NULL;
     }
     return kmalloc(size);
 }
@@ -234,9 +179,7 @@ static void coalesce(struct block_header *block)
 
 void kfree(void *ptr)
 {
-    if (ptr == NULL) {
-        return;
-    }
+    if (ptr == NULL) return;
     struct block_header *block =
         (struct block_header *)((uint8_t *)ptr - HEADER_SIZE);
 
@@ -245,9 +188,6 @@ void kfree(void *ptr)
         return;
     }
 
-    if (block->size >= 65536) {
-        trace_big("FREE ", block, block->size);
-    }
     used_bytes -= block->size;
     block->is_free = 1;
     coalesce(block);
@@ -256,45 +196,32 @@ void kfree(void *ptr)
 void *kcalloc(size_t nmemb, size_t size)
 {
     size_t total = nmemb * size;
+    if (size != 0 && total / size != nmemb) return NULL; /* overflow */
     void *ptr = kmalloc(total);
     if (ptr) {
         uint8_t *p = (uint8_t *)ptr;
-        for (size_t i = 0; i < total; i++) {
-            p[i] = 0;
-        }
+        for (size_t i = 0; i < total; i++) p[i] = 0;
     }
     return ptr;
 }
 
 void *krealloc(void *ptr, size_t size)
 {
-    if (ptr == NULL) {
-        return kmalloc(size);
-    }
-    if (size == 0) {
-        kfree(ptr);
-        return NULL;
-    }
+    if (ptr == NULL) return kmalloc(size);
+    if (size == 0) { kfree(ptr); return NULL; }
 
     struct block_header *block =
         (struct block_header *)((uint8_t *)ptr - HEADER_SIZE);
-    if (block->size >= size) {
-        return ptr;
-    }
+    if (block->size >= size) return ptr;
 
     void *new_ptr = kmalloc(size);
-    if (!new_ptr) {
-        return NULL;
-    }
+    if (!new_ptr) return NULL;
     uint8_t *src = (uint8_t *)ptr;
     uint8_t *dst = (uint8_t *)new_ptr;
-    for (size_t i = 0; i < block->size; i++) {
-        dst[i] = src[i];
-    }
+    for (size_t i = 0; i < block->size; i++) dst[i] = src[i];
     kfree(ptr);
     return new_ptr;
 }
-
 
 size_t heap_block_size(const void *p)
 {
@@ -305,21 +232,25 @@ size_t heap_block_size(const void *p)
     return b->size;
 }
 
-
 void *heap_find_used_block(size_t min_size)
 {
     void *best = NULL;
     size_t best_size = 0;
-    const struct block_header *b = free_list;
-    while (b) {
+    uintptr_t addr = (uintptr_t)heap_start;
+
+    while (addr < (uintptr_t)heap_end) {
+        struct block_header *b = (struct block_header *)addr;
         if (b->magic != HEAP_MAGIC) break;
+
         if (!b->is_free && b->size >= min_size &&
             (best == NULL || b->size < best_size)) {
             best = (void *)((uint8_t *)b + HEADER_SIZE);
             best_size = b->size;
         }
-        b = b->next;
+
+        addr += HEADER_SIZE + b->size;
     }
+
     return best;
 }
 

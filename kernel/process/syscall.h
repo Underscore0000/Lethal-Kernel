@@ -13,6 +13,8 @@
 #define SYS_PIPE    7
 #define SYS_READ    8
 #define SYS_CLOSE   9
+#define SYS_SLEEP  10
+#define SYS_WAIT   11
 
 void syscall_handler(struct interrupt_frame *frame);
 
