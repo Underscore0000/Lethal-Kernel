@@ -52,4 +52,6 @@ void fb_putpixel(int x, int y, uint32_t color);
 
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
 
+uint32_t fb_getpixel(int x, int y);
+
 #endif /* LETHAL_DRIVERS_VIDEO_FRAMEBUFFER_H */

@@ -15,6 +15,14 @@
 #include "../process/process.h"
 #include "../smp/ipi.h"
 #include <stddef.h>
+#include "../drivers/serial/serial.h"
+
+int current_pid_for_debug(void)
+{
+    extern struct user_process *process_current(void);
+    struct user_process *p = process_current();
+    return p ? p->pid : -1;
+}
 
 struct idt_entry {
     uint16_t offset_low;
@@ -194,20 +202,14 @@ void irq_handler(struct interrupt_frame *frame)
 {
     uint8_t irq = (uint8_t)(frame->int_no - 32);
 
-    /* Handle IRQ0 (PIT timer) */
     if (irq == 0) {
         timer_tick_handler();
         process_schedule_from_interrupt(frame);
     }
-    /* Handle IRQ1 (Keyboard) */
     else if (irq == 1) {
         keyboard_irq_handler();
     }
 
-    /* Send EOI to slave PIC if IRQ >= 8 */
-    if (irq >= 8) {
-        outb(0xA0, 0x20);
-    }
-    /* Send EOI to master PIC */
+    if (irq >= 8) outb(0xA0, 0x20);
     outb(0x20, 0x20);
 }

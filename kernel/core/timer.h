@@ -10,6 +10,9 @@ void timer_init(uint32_t hz);
 /* Total ticks since timer_init(). */
 uint64_t timer_ticks(void);
 
+/* Configured tick rate in Hz (0 before timer_init). */
+uint32_t timer_hz(void);
+
 /* Total milliseconds elapsed since timer_init(), derived from the
  * configured frequency. */
 uint64_t timer_ms(void);
@@ -19,7 +22,7 @@ uint64_t timer_ms(void);
 void timer_sleep_ms(uint64_t ms);
 
 /* Called by the IRQ0 stub (arch/x86_64/isr_stubs.asm -> idt.c irq_handler)
- * on every timer interrupt. */
+ * on every timer interrupt. Also wakes SLEEPING user processes. */
 void timer_tick_handler(void);
 
 #endif

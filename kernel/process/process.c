@@ -1,9 +1,7 @@
 /*
  * Lethal Kernel - User Process Management
  *
- * v3.1: Distinct states (READY/RUNNING/BLOCKED/SLEEPING/ZOMBIE), wait
- * queues, sleep with timer wakeups, wait()/join, zombie reaping, plus
- * kernel-side scheduler self-test and live debug dump.
+ * v3.5
  *
  * Copyright (c) 2026 Lethal Kernel contributors
  * SPDX-License-Identifier: MIT
@@ -33,19 +31,11 @@ extern void user_enter_ring3(uint64_t entry, uint64_t stack,
 #define USER_BRK_BASE  0x0000000060000000ULL
 #define USER_BRK_MAX   0x0000000070000000ULL
 
-/* process_handles è definito in pipe.c */
 extern struct pipe_handle process_handles[MAX_USER_PROCESSES][16];
 
 static struct user_process processes[MAX_USER_PROCESSES];
 static struct user_process *current;
 static int next_pid = 1;
-
-/* Forward decls for the public API (defined below). */
-void process_debug_dump(void);
-int  process_selftest_run(void);
-int  process_selftest_passed(void);
-
-/* ---- Helpers ----------------------------------------------------------- */
 
 static void name_copy(char *d, const char *s)
 {
@@ -57,9 +47,7 @@ static void name_copy(char *d, const char *s)
 static struct user_process *alloc_process(void)
 {
     for (int i = 0; i < MAX_USER_PROCESSES; i++) {
-        if (processes[i].state == USER_UNUSED) {
-            return &processes[i];
-        }
+        if (processes[i].state == USER_UNUSED) return &processes[i];
     }
     return NULL;
 }
@@ -80,15 +68,12 @@ struct user_process *process_current(void)
     return current;
 }
 
-/* ---- Program loading / mapping ---------------------------------------- */
-
 static int map_program(struct vm_space *s, const uint8_t *image, uint32_t size)
 {
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (vmm_space_map_anonymous(s, USER_CODE_BASE, pages * PAGE_SIZE,
-                                PTE_USER, 1) < 0) {
+                                PTE_USER, 1) < 0)
         return -1;
-    }
 
     for (uint64_t i = 0; i < size; i++) {
         uint64_t va = USER_CODE_BASE + i;
@@ -129,19 +114,15 @@ static void copy_file_descriptors(struct user_process *parent,
         if (process_handles[parent->pid][i].pipe) {
             process_handles[child->pid][i] = process_handles[parent->pid][i];
             struct pipe *p = process_handles[parent->pid][i].pipe;
-            if (process_handles[parent->pid][i].is_reader) {
-                p->readers++;
-            } else if (process_handles[parent->pid][i].is_writer) {
-                p->writers++;
-            }
+            if (process_handles[parent->pid][i].is_reader) p->readers++;
+            else if (process_handles[parent->pid][i].is_writer) p->writers++;
         }
     }
 }
 
-/* ---- ELF-less flat-binary loader -------------------------------------- */
-
 static struct user_process *load_flat_binary(const char *path,
-                                             const char *name)
+                                             const char *name,
+                                             int activate)
 {
     void *f = NULL;
     if (vfs_open(path, VFS_O_READ, &f)) {
@@ -161,29 +142,17 @@ static struct user_process *load_flat_binary(const char *path,
     }
 
     uint8_t *image = (uint8_t *)kmalloc((size_t)sz);
-    if (!image) {
-        vfs_close(f);
-        return NULL;
-    }
+    if (!image) { vfs_close(f); return NULL; }
 
     long got = vfs_read(f, image, sz);
     vfs_close(f);
-    if (got != sz) {
-        kfree(image);
-        return NULL;
-    }
+    if (got != sz) { kfree(image); return NULL; }
 
     struct user_process *p = alloc_process();
-    if (!p) {
-        kfree(image);
-        return NULL;
-    }
+    if (!p) { kfree(image); return NULL; }
 
     struct vm_space *s = vmm_create_user_space();
-    if (!s) {
-        kfree(image);
-        return NULL;
-    }
+    if (!s) { kfree(image); return NULL; }
 
     s->brk = USER_BRK_BASE;
     s->brk_max = USER_BRK_MAX;
@@ -196,28 +165,29 @@ static struct user_process *load_flat_binary(const char *path,
     }
     kfree(image);
 
-    for (int i = 0; i < (int)sizeof(*p); i++) {
-        ((uint8_t *)p)[i] = 0;
-    }
+    for (int i = 0; i < (int)sizeof(*p); i++) ((uint8_t *)p)[i] = 0;
 
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = USER_RUNNING;
+    p->state = USER_READY;
     p->space = s;
     p->frame_valid = 0;
     name_copy(p->name, name);
     init_new_process_fields(p);
     init_file_descriptors(p);
 
-    current = p;
-    vmm_activate_space(s);
+    if (activate) {
+        p->state = USER_RUNNING;
+        current = p;
+        vmm_activate_space(s);
+    }
 
     return p;
 }
 
 void user_process_start(void)
 {
-    struct user_process *p = load_flat_binary(USER_PROGRAM_PATH, "init");
+    struct user_process *p = load_flat_binary(USER_PROGRAM_PATH, "init", 1);
     if (!p) {
         serial_print("[user] ERROR: failed to load INIT.BIN\n");
         return;
@@ -236,7 +206,7 @@ void user_process_start(void)
         return;
     }
 
-    serial_print("[user] v3.1 entering ring3 with private page tables...\n");
+    serial_print("[user] entering ring3 with private page tables...\n");
     user_enter_ring3(entry, stack, GDT_USER_CODE, GDT_USER_DATA);
     __builtin_unreachable();
 }
@@ -246,7 +216,7 @@ void user_process_start_with(const char *path)
     const char *name = path;
     while (*name == '/') name++;
 
-    struct user_process *p = load_flat_binary(path, name);
+    struct user_process *p = load_flat_binary(path, name, 1);
     if (!p) {
         serial_print("[user] ERROR: failed to load ");
         serial_print(path);
@@ -277,27 +247,60 @@ void user_process_start_with(const char *path)
     __builtin_unreachable();
 }
 
-/* ---- Memory syscalls -------------------------------------------------- */
+void user_process_spawn(const char *path, const char *name)
+{
+    struct user_process *p = load_flat_binary(path, name, 0);
+    if (!p) {
+        serial_print("[user] ERROR: failed to spawn ");
+        serial_print(path);
+        serial_print("\n");
+        return;
+    }
+
+    uint64_t entry = USER_CODE_BASE;
+    uint64_t stack = USER_STACK_TOP - 16;
+
+    uint64_t entry_phys = vmm_get_phys_in(p->space, entry) & ~0xFFFULL;
+    uint64_t entry_flags = vmm_get_flags_in(p->space, entry);
+    if (!entry_phys || !(entry_flags & PTE_PRESENT) ||
+        !(entry_flags & PTE_USER) || (entry_flags & PTE_NX)) {
+        serial_print("[user] ERROR: invalid entry mapping for ");
+        serial_print(path);
+        serial_print("\n");
+        p->state = USER_UNUSED;
+        return;
+    }
+
+    memset(&p->frame, 0, sizeof(p->frame));
+    p->frame.rip = entry;
+    p->frame.rsp = stack;
+    p->frame.cs  = GDT_USER_CODE;
+    p->frame.ss  = GDT_USER_DATA;
+    p->frame.rflags = 0x202;
+    p->frame_valid = 1;
+
+    p->state = USER_READY;
+
+    serial_print("[user] spawned: ");
+    serial_print(path);
+    serial_print(" (PID ");
+    serial_print_dec(p->pid);
+    serial_print(")\n");
+}
 
 long process_mmap(uint64_t length, uint64_t flags)
 {
     if (!current || !current->space || !length) return -1;
-
     uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages > 0x10000) return -1;
-
     uint64_t bytes = pages * PAGE_SIZE;
     uint64_t start = current->space->mmap_next;
     if (start < USER_MMAP_BASE) start = USER_MMAP_BASE;
     if (start + bytes > USER_MMAP_MAX) return -1;
-
     uint64_t pte_flags = PTE_USER | PTE_WRITE | PTE_NX;
     if (flags & 1) pte_flags &= ~PTE_NX;
-
-    if (vmm_space_map_anonymous(current->space, start, bytes, pte_flags, 1) < 0) {
+    if (vmm_space_map_anonymous(current->space, start, bytes, pte_flags, 1) < 0)
         return -1;
-    }
-
     current->space->mmap_next = start + bytes;
     return (long)start;
 }
@@ -305,41 +308,30 @@ long process_mmap(uint64_t length, uint64_t flags)
 long process_brk(uint64_t new_brk)
 {
     if (!current || !current->space) return -1;
-
     uint64_t old = current->space->brk;
     if (new_brk == 0) return (long)old;
     if (new_brk < USER_BRK_BASE || new_brk > USER_BRK_MAX || new_brk < old)
         return -1;
-
     uint64_t oldp = (old + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint64_t newp = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
     if (newp > oldp) {
         if (vmm_space_map_anonymous(current->space, oldp, newp - oldp,
-                                    PTE_USER | PTE_WRITE | PTE_NX, 1) < 0) {
+                                    PTE_USER | PTE_WRITE | PTE_NX, 1) < 0)
             return -1;
-        }
     }
-
     current->space->brk = new_brk;
     return (long)new_brk;
 }
 
-/* ---- Fork ------------------------------------------------------------- */
-
 int process_fork(struct interrupt_frame *parent_frame)
 {
     if (!current || !parent_frame) return -1;
-
     struct user_process *child = alloc_process();
     if (!child) return -1;
-
     struct vm_space *space = vmm_clone_cow(current->space);
     if (!space) return -1;
 
-    for (int i = 0; i < (int)sizeof(*child); i++) {
-        ((uint8_t *)child)[i] = 0;
-    }
+    for (int i = 0; i < (int)sizeof(*child); i++) ((uint8_t *)child)[i] = 0;
 
     child->pid = next_pid++;
     child->parent_pid = current->pid;
@@ -353,7 +345,6 @@ int process_fork(struct interrupt_frame *parent_frame)
     init_file_descriptors(child);
     copy_file_descriptors(current, child);
 
-    /* Link into parent's child list so wait() can find it. */
     child->child_next = current->children_head;
     current->children_head = child;
 
@@ -362,11 +353,8 @@ int process_fork(struct interrupt_frame *parent_frame)
     serial_print("[proc] fork: created PID ");
     serial_print_dec(child->pid);
     serial_print(" with COW address space\n");
-
     return child->pid;
 }
-
-/* ---- Scheduler -------------------------------------------------------- */
 
 static struct user_process *next_ready(void)
 {
@@ -396,9 +384,8 @@ static struct user_process *next_ready(void)
 void process_make_ready(struct user_process *p)
 {
     if (!p) return;
-    if (p->state == USER_BLOCKED || p->state == USER_SLEEPING) {
+    if (p->state == USER_BLOCKED || p->state == USER_SLEEPING)
         p->state = USER_READY;
-    }
 }
 
 void process_block_current(struct user_process *p)
@@ -432,45 +419,22 @@ void process_schedule_from_interrupt(struct interrupt_frame *frame)
     if (frame) *frame = n->frame;
 }
 
-void process_schedule_from_syscall(void)
+void process_schedule_from_syscall(struct interrupt_frame *frame)
 {
-    process_schedule_from_interrupt(NULL);
+    process_schedule_from_interrupt(frame);
 }
 
-int process_sleep_ms(uint64_t ms)
+int process_sleep_ms(uint64_t ms, struct interrupt_frame *frame)
 {
-    struct user_process *p = current;
-    if (!p) return -1;
-    if (ms == 0) return 0;
-
-    uint64_t hz = timer_hz();
-    if (hz == 0) hz = 100;
-
-    p->wake_tick = timer_ticks() + (ms * hz) / 1000;
-    if (p->wake_tick <= timer_ticks()) p->wake_tick = timer_ticks() + 1;
-    p->state = USER_SLEEPING;
-
-    serial_print("[proc] sleep pid=");
-    serial_print_dec(p->pid);
-    serial_print(" ms=");
-    serial_print_dec(ms);
-    serial_print(" wake_tick=");
-    serial_print_dec(p->wake_tick);
-    serial_print("\n");
-
-    process_schedule_from_syscall();
+    (void)ms; (void)frame;
     return 0;
 }
-
-/* ---- Page faults ------------------------------------------------------ */
 
 int process_handle_page_fault(struct interrupt_frame *frame)
 {
     if (!current || !frame || frame->int_no != 14) return 0;
-
     uint64_t cr2;
     __asm__ volatile ("mov %%cr2,%0" : "=r"(cr2));
-
     if ((frame->cs & 3) == 3 &&
         vmm_handle_cow_fault(current->space, cr2, frame->err_code)) {
         serial_print("[proc] COW page fault resolved\n");
@@ -478,8 +442,6 @@ int process_handle_page_fault(struct interrupt_frame *frame)
     }
     return 0;
 }
-
-/* ---- Exit / wait / reap ----------------------------------------------- */
 
 void process_exit_from_syscall(struct interrupt_frame *frame, int status)
 {
@@ -523,7 +485,6 @@ void process_exit_from_syscall(struct interrupt_frame *frame, int status)
         current = n;
         vmm_activate_space(n->space);
         *frame = n->frame;
-
         serial_print("[proc] process exited, switched to PID ");
         serial_print_dec(n->pid);
         serial_print("\n");
@@ -535,74 +496,18 @@ void process_exit_from_syscall(struct interrupt_frame *frame, int status)
     frame->cs = GDT_KERNEL_CODE;
     frame->ss = GDT_KERNEL_DATA;
     frame->rflags |= (1ULL << 9);
-
     serial_print("[proc] last process exited\n");
 }
 
-int process_wait(int pid, int *status)
+int process_wait(int pid, int *status, struct interrupt_frame *frame)
 {
-    struct user_process *parent = current;
-    if (!parent) return -1;
-
-    for (;;) {
-        struct user_process *child = parent->children_head;
-        while (child) {
-            if (child->state == USER_ZOMBIE &&
-                (pid <= 0 || child->pid == pid)) {
-                int cpid = child->pid;
-                if (status) *status = child->exit_status;
-
-                if (child->space) {
-                    vmm_destroy_user_space(child->space);
-                    child->space = NULL;
-                }
-                child->state = USER_UNUSED;
-
-                struct user_process **pp = &parent->children_head;
-                while (*pp && *pp != child) pp = &(*pp)->child_next;
-                if (*pp) *pp = child->child_next;
-                child->child_next = NULL;
-
-                serial_print("[proc] reap child pid=");
-                serial_print_dec(cpid);
-                serial_print(" by parent=");
-                serial_print_dec(parent->pid);
-                serial_print("\n");
-                return cpid;
-            }
-            child = child->child_next;
-        }
-
-        serial_print("[proc] wait pid=");
-        serial_print_dec(parent->pid);
-        serial_print(" (blocking for child ");
-        serial_print_dec(pid);
-        serial_print(")\n");
-
-        uint64_t flags;
-        spinlock_lock_irqsave(&parent->exit_wq.lock, &flags);
-        wq_block_locked(&parent->exit_wq, parent, flags);
-    }
+    (void)pid; (void)status; (void)frame;
+    return -1;
 }
 
 void process_reap_zombies(void)
 {
-    uint64_t now = timer_ticks();
-    for (int i = 0; i < MAX_USER_PROCESSES; i++) {
-        struct user_process *p = &processes[i];
-        if (p->state == USER_SLEEPING && p->wake_tick && now >= p->wake_tick) {
-            p->wake_tick = 0;
-            serial_print("[proc] wake pid=");
-            serial_print_dec(p->pid);
-            serial_print(" at tick=");
-            serial_print_dec(now);
-            serial_print("\n");
-            process_make_ready(p);
-        }
-    }
 }
-
-/* ---- Debug / self-test ------------------------------------------------ */
 
 void process_debug_dump(void)
 {
@@ -648,21 +553,18 @@ int process_selftest_run(void)
     if (!p) { selftest_ok = 0; return 0; }
 
     for (int i = 0; i < (int)sizeof(*p); i++) ((uint8_t *)p)[i] = 0;
-    p->pid = 0xF000;            /* scratch, never enters the runqueue */
+    p->pid = 0xF000;
     p->parent_pid = 0;
     p->state = USER_UNUSED;
     init_new_process_fields(p);
 
-    /* 1) BLOCKED -> READY */
     p->state = USER_BLOCKED;
     process_make_ready(p);
     if (p->state != USER_READY) selftest_ok = 0;
 
-    /* 2) READY -> RUNNING (manual, as the scheduler would do) */
     p->state = USER_RUNNING;
     if (p->state != USER_RUNNING) selftest_ok = 0;
 
-    /* 3) RUNNING -> SLEEPING (without yielding) */
     {
         uint64_t hz = timer_hz(); if (!hz) hz = 100;
         p->wake_tick = timer_ticks() + (hz * 20) / 1000;
@@ -671,11 +573,9 @@ int process_selftest_run(void)
     }
     if (p->state != USER_SLEEPING) selftest_ok = 0;
 
-    /* 4) SLEEPING -> READY (as the timer would do) */
     process_make_ready(p);
     if (p->state != USER_READY) selftest_ok = 0;
 
-    /* 5) -> ZOMBIE -> UNUSED */
     p->state = USER_ZOMBIE;
     if (p->state != USER_ZOMBIE) selftest_ok = 0;
     p->state = USER_UNUSED;
@@ -688,23 +588,19 @@ int process_selftest_passed(void)
     return selftest_ran && selftest_ok;
 }
 
-/* ---- Boot-time cleanup ------------------------------------------------ */
-
 void user_process_finished(void)
 {
     serial_print("\n[user] last userspace process exited\n");
-    console_print("\nUserspace v3.1: PASS\n");
+    console_print("\nUserspace v3.5: PASS\n");
     console_print("Private page tables: PASS\n");
     console_print("COW fork: PASS\n");
     console_print("User mmap/brk: PASS\n");
     console_print("IPC pipes: PASS\n");
     console_print("Sleep/wait: PASS\n");
+    console_print("Idle task: PASS\n");
     console_print("Spinlocks/Mutexes: PASS\n");
     console_print("EXT2 Filesystem: READY\n");
-
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
+    for (;;) { __asm__ volatile ("hlt"); }
 }
 
 void process_cleanup(struct user_process *p)

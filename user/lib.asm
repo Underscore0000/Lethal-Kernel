@@ -1,6 +1,5 @@
 bits 64
 
-; Minimal v0.12 userspace ABI with IPC support
 global malloc
 global brk
 global fork
@@ -10,6 +9,8 @@ global exit
 global yield
 global pipe
 global close
+global sleep
+global sys_wait
 
 malloc:
     mov rax, 3
@@ -53,5 +54,22 @@ pipe:
 
 close:
     mov rax, 9
+    int 0x80
+    ret
+
+sleep:
+    mov rax, 10
+    int 0x80
+    ret
+
+sys_wait:
+    cmp rdi, 0x0000000040000000
+    jb .wait_pid_mode
+    mov rsi, rdi
+    mov rdi, -1
+    jmp .wait_do
+.wait_pid_mode:
+.wait_do:
+    mov rax, 11
     int 0x80
     ret

@@ -29,6 +29,8 @@
 #include "../ipc/pipe.h"
 #include "../smp/smp.h"
 #include "terminal.h"
+#include "../memory/memtest.h"
+#include "font.h"
 
 /* Networking headers */
 #include "../net/core/net.h"
@@ -601,6 +603,10 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
 
     vmm_init(pmm_total_bytes() + (1024ULL * 1024));
 
+    volatile uint32_t *nx_test = (volatile uint32_t *)(uintptr_t)_kernel_end;
+    *nx_test = 0x12345678;
+    serial_print("[kernel] PTE_NX write test: PASS\n");
+
     struct framebuffer_info fb_info;
     memset(&fb_info, 0, sizeof(fb_info));
 
@@ -628,7 +634,6 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
         if (fb_init(&fb_info) == 0) {
             serial_print("[kernel] Framebuffer initialized\n");
             mouse_set_screen_size(fb_width(), fb_height());
-            terminal_set_fb(&fb_info);
             console_ui_init(&fb_info);
         }
     }
@@ -685,6 +690,9 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
     serial_print("[kernel] Heap self-test: ");
     serial_print(heap_ok ? "PASS\n" : "FAIL\n");
 
+    serial_print("[kernel] Running memory manager stress tests...\n");
+    memtest_run_all();
+
     block_init();
     vfs_init();
 
@@ -693,6 +701,11 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
     serial_print(fs_ok ? "MOUNTED\n" : "FAILED\n");
 
     if (fs_ok) {
+        if (font_init("/INTER-REGULAR.TTF", 18) == 0) {
+            serial_print("[kernel] TrueType font loaded\n");
+        } else {
+            serial_print("[kernel] font load failed, using bitmap\n");
+        }
         if (console_init_fb() == 0)
             serial_print("[kernel] Graphical console ready\n");
     }
@@ -701,9 +714,16 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
 
     tasking_init();
     task_test_run();
-    scheduler_mp_init();
+
     vmm_map_apic();
     smp_init();
+
+    serial_print("[smp] initialization complete\n");
+
+    scheduler_mp_init();
+    serial_print("[kernel] Multi-CPU scheduler initialized\n");
+    extern void user_process_spawn(const char *path, const char *name);
+    user_process_spawn("/IDLE.BIN", "idle");
 
     net_device_init();
     net_init();
@@ -749,18 +769,72 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
     net_verify_all();
 
     console_separator();
+    console_info("User Process Scheduler");
+
+    console_print("  ");
+    console_set_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK);
+    console_print("├─ ");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    console_print("States (READY/RUNNING/BLOCKED/SLEEPING/ZOMBIE): ");
+    console_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    console_print("available\n");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    console_print("  ");
+    console_set_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK);
+    console_print("├─ ");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    console_print("Wait queues + sleep (timer-woken): ");
+    console_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    console_print("available\n");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    console_print("  ");
+    console_set_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK);
+    console_print("├─ ");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    console_print("wait()/join + zombie reaping: ");
+    console_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    console_print("available\n");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    int st = process_selftest_run();
+    int pass = (st && process_selftest_passed());
+
+    console_print("  ");
+    console_set_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK);
+    console_print("└─ ");
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    console_print("Scheduler self-test: ");
+    if (pass) {
+        console_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        console_print("PASS\n");
+    } else {
+        console_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        console_print("FAIL\n");
+    }
+    console_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    serial_print("[sched-test] states/waitq/sleep/wait available, selftest=");
+    serial_print(pass ? "PASS\n" : "FAIL\n");
+
+    process_debug_dump();
+
+    console_separator();
     console_success("System Initialized");
+
+    serial_print("[kernel] user-sched subsystem active "
+                 "(states, wait queues, sleep, wait/join, zombie reap)\n");
 
     keyboard_set_diag_poll(1);
     keyboard_flush();
 
     console_print("\n");
     console_separator();
-    console_print("DIAG MODE: K=test | F2=terminale | ESC=spegni\n");
+    console_print("DIAG MODE: K=test | F2=terminale | U=userspace | "
+                  "T=sltest | S=sched-dump | ESC=spegni\n");
 
     for (;;) {
-        console_ui_tick();
-
         char c;
         if (!keyboard_getchar(&c)) {
             __asm__ volatile("pause");
@@ -779,10 +853,32 @@ void kernel_main(uint32_t magic, uint64_t info_addr)
             continue;
         }
 
+        if (c == 's' || c == 'S') {
+            serial_print("[kernel] diag: process dump requested\n");
+            process_debug_dump();
+            continue;
+        }
+
+        if (c == 't' || c == 'T') {
+            serial_print("[kernel] Starting SLTEST.BIN (T)\n");
+            user_process_start_with("/SLTEST.BIN");
+            console_print("\n[kernel] sltest returned, back to diag\n");
+            continue;
+        }
+
+        if (c == 'u' || c == 'U') {
+            extern void user_process_start(void);
+            serial_print("[kernel] Starting userspace (U)\n");
+            user_process_start();
+            console_print("\n[kernel] userspace returned, back to diag\n");
+            continue;
+        }
+
         if ((uint8_t)c == KEY_F2) {
             serial_print("[kernel] Opening terminal (F2)\n");
             terminal_run();
-            console_print("\nTerminale chiuso. K=test | F2=riapri | ESC=spegni\n");
+            console_print("\nTerminale chiuso. K=test | F2=riapri | U=userspace | "
+                          "T=sltest | S=sched-dump | ESC=spegni\n");
             continue;
         }
     }

@@ -12,16 +12,12 @@
 #include "../drivers/serial/serial.h"
 #include "../drivers/video/framebuffer.h"
 
-/* Scala del font 8x8 integrato: cella = 8*X by 8*Y pixel.
- * Default 1x2 -> cella 8x16 (50 righe su 800px).
- * Per un testo piu' grande prova 2x2 (cella 16x16). */
 #ifndef CONSOLE_FONT_SCALE_X
 #define CONSOLE_FONT_SCALE_X 1
 #endif
 #ifndef CONSOLE_FONT_SCALE_Y
 #define CONSOLE_FONT_SCALE_Y 2
 #endif
-
 
 #define CONSOLE_TRANSPARENT 0xFF000000u
 
@@ -63,13 +59,18 @@ void console_ui_init(const struct framebuffer_info *info);
 void console_ui_tick(void);
 void console_scroll(int lines);
 
-
-int  console_cell_w(void);   
-int  console_cell_h(void);  
+int  console_cell_w(void);
+int  console_cell_h(void);
 void console_draw_glyph(int x, int y, uint32_t cp, uint32_t fg, uint32_t bg);
 void console_draw_text(int x, int y, const char *utf8, uint32_t fg, uint32_t bg);
 int  console_text_width(const char *utf8);
 
 const uint8_t *console_get_glyph(uint32_t cp);
 
+/* Used by font.c to alpha-blend against the backbuffer. */
+uint32_t console_read_pixel(int x, int y);
+
+void     console_write_pixel(int x, int y, uint32_t color);
+int      console_pixel_width(void);
+int      console_pixel_height(void);
 #endif /* LETHAL_CONSOLE_H */

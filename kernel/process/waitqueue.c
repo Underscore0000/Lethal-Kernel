@@ -1,9 +1,3 @@
-/*
- * Lethal Kernel - Wait queues implementation
- *
- * Copyright (c) 2026 Lethal Kernel contributors
- * SPDX-License-Identifier: MIT
- */
 #include "waitqueue.h"
 #include "process.h"
 #include "../core/spinlock.h"
@@ -42,12 +36,12 @@ static void remove_locked(struct wait_queue *q, struct user_process *p)
 }
 
 void wq_block_locked(struct wait_queue *q, struct user_process *p,
-                     uint64_t flags)
+                     uint64_t flags, struct interrupt_frame *frame)
 {
     enqueue_locked(q, p);
     process_block_current(p);
     spinlock_unlock_irqrestore(&q->lock, flags);
-    process_schedule_from_syscall();
+    process_schedule_from_syscall(frame);
 }
 
 void wq_wake_one(struct wait_queue *q)

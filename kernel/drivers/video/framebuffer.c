@@ -178,3 +178,13 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color)
             row[xx] = color;
     }
 }
+
+uint32_t fb_getpixel(int x, int y)
+{
+    if (!fb_ptr) return 0;
+    if (x < 0 || y < 0) return 0;
+    if ((uint32_t)x >= fb_w || (uint32_t)y >= fb_h) return 0;
+
+    uint32_t *row = (uint32_t *)((uint8_t *)fb_ptr + (uint64_t)y * fb_p);
+    return row[x];
+}

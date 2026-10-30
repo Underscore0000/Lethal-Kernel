@@ -1,6 +1,5 @@
-
 /*
- * Lethal Kernel - Graphical Terminal (movable window, bitmap font)
+ * Lethal Kernel - Graphical Terminal (movable window, TrueType font)
  *
  * Copyright (c) 2026 Lethal Kernel contributors
  * SPDX-License-Identifier: MIT
@@ -8,9 +7,11 @@
 
 #include "terminal.h"
 #include "console.h"
+#include "font.h"
 #include "../drivers/serial/serial.h"
 #include "../drivers/input/mouse.h"
 #include "../drivers/input/keyboard.h"
+#include "../drivers/video/framebuffer.h"
 #include "../memory/heap.h"
 
 #include <string.h>
@@ -22,16 +23,13 @@
 
 #define WIN_DEFAULT_W 640
 #define WIN_DEFAULT_H 400
-#define TITLE_H       28
+#define TITLE_H       32
 #define PAD           10
 
 #define CW     (console_cell_w())
 #define CH     (console_cell_h())
 #define LINE_H (CH + 4)
 
-static uint8_t *tfb_base;
-static uint32_t tfb_w, tfb_h, tfb_pitch, tfb_bpp;
-static uint32_t rpos, rsz, gpos, gsz, bpos, bsz;
 static int tfb_ok;
 
 static int32_t win_x, win_y, win_w, win_h;
@@ -47,12 +45,13 @@ static char input_buf[LINE_MAX];
 static int input_len = 0;
 static int caret_on = 0;
 
-static uint8_t *saved_bg = NULL;
+static uint32_t *saved_bg = NULL;
 
+/* Cursor */
 #define CURSOR_W 11
 #define CURSOR_H 16
 
-static uint8_t cursor_bg[CURSOR_W * CURSOR_H * 4];
+static uint32_t cursor_bg[CURSOR_W * CURSOR_H];
 static int cursor_saved = 0;
 static int32_t cursor_x = 0, cursor_y = 0;
 
@@ -75,150 +74,78 @@ static const char *const arrow[CURSOR_H] = {
     "     XXX   ",
 };
 
-static uint32_t rgb(uint8_t r, uint8_t g, uint8_t b)
+/* -------- Low-level drawing on the global framebuffer -------- */
+
+
+
+static void fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c)
 {
-    return ((uint32_t)(r >> (8 - rsz)) << rpos) |
-           ((uint32_t)(g >> (8 - gsz)) << gpos) |
-           ((uint32_t)(b >> (8 - bsz)) << bpos);
+    fb_fill_rect((int)x, (int)y, (int)w, (int)h, c);
 }
 
-static void put_px(int32_t x, int32_t y, uint32_t c)
+/* -------- Text drawing (TrueType via font.c) -------- */
+
+
+static void draw_text(int32_t x, int32_t y_baseline, const char *s, uint32_t color, int32_t max_x)
 {
-    if (x < 0 || y < 0 ||
-        x >= (int32_t)tfb_w || y >= (int32_t)tfb_h)
-        return;
+    if (!font_is_ready()) return;
 
-    uint8_t *p = tfb_base
-        + (uint64_t)y * tfb_pitch
-        + (uint64_t)x * (tfb_bpp / 8);
+    int ascent = font_ascent();
 
-    if (tfb_bpp == 32) {
-        *(volatile uint32_t *)p = c;
-    } else if (tfb_bpp == 24) {
-        p[0] = (uint8_t)c;
-        p[1] = (uint8_t)(c >> 8);
-        p[2] = (uint8_t)(c >> 16);
-    } else {
-        *(volatile uint16_t *)p = (uint16_t)c;
-    }
-}
-
-static void fill_rect(int32_t x, int32_t y,
-                      int32_t w, int32_t h, uint32_t c)
-{
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-
-    if (x + w > (int32_t)tfb_w)
-        w = (int32_t)tfb_w - x;
-
-    if (y + h > (int32_t)tfb_h)
-        h = (int32_t)tfb_h - y;
-
-    if (w <= 0 || h <= 0)
-        return;
-
-    if (tfb_bpp == 32) {
-        for (int32_t j = 0; j < h; j++) {
-            volatile uint32_t *p = (volatile uint32_t *)
-                (tfb_base
-                 + (uint64_t)(y + j) * tfb_pitch
-                 + (uint64_t)x * 4);
-
-            for (int32_t i = 0; i < w; i++)
-                p[i] = c;
-        }
-    } else {
-        for (int32_t j = 0; j < h; j++) {
-            for (int32_t i = 0; i < w; i++)
-                put_px(x + i, y + j, c);
-        }
-    }
-}
-
-static void draw_glyph(int32_t x, int32_t y,
-                       uint32_t cp, uint32_t color)
-{
-    const uint8_t *g = console_get_glyph(cp);
-
-    for (int row = 0; row < 8; row++) {
-        uint8_t bits = g[row];
-        int col = 0;
-
-        while (col < 8) {
-            if (bits & (1u << col)) {
-                int start = col;
-
-                while (col < 8 && (bits & (1u << col)))
-                    col++;
-
-                fill_rect(
-                    x + start * CONSOLE_FONT_SCALE_X,
-                    y + row * CONSOLE_FONT_SCALE_Y,
-                    (col - start) * CONSOLE_FONT_SCALE_X,
-                    CONSOLE_FONT_SCALE_Y,
-                    color
-                );
-            } else {
-                col++;
-            }
-        }
-    }
-}
-
-static void draw_text(int32_t x, int32_t y,
-                      const char *s, uint32_t color, int32_t max_x)
-{
     while (*s) {
-        uint8_t ch = (uint8_t)*s++;
+        uint32_t cp = 0;
+        const uint8_t *p = (const uint8_t *)s;
 
-        if ((ch & 0xC0) == 0x80)
-            continue;
+        if (p[0] < 0x80) { cp = p[0]; s += 1; }
+        else if ((p[0] & 0xE0) == 0xC0) { cp = p[0] & 0x1F; s += 1; continue; }
+        else if ((p[0] & 0xF0) == 0xE0) { cp = p[0] & 0x0F; s += 1; continue; }
+        else if ((p[0] & 0xF8) == 0xF0) { cp = p[0] & 0x07; s += 1; continue; }
+        else { s += 1; continue; }
 
-        if (x + CW > max_x)
-            break;
+        int adv = font_advance(cp);
+        if (x + adv > max_x) break;
 
-        draw_glyph(x, y, ch < 0x80 ? ch : '?', color);
-        x += CW;
+        font_draw_codepoint((int)x, (int)y_baseline - ascent, cp, color);
+        x += adv;
     }
 }
+
+static int text_width(const char *s)
+{
+    if (!font_is_ready()) return 0;
+    int w = 0;
+    while (*s) {
+        const uint8_t *p = (const uint8_t *)s;
+        uint32_t cp;
+        if (p[0] < 0x80) { cp = p[0]; s += 1; }
+        else if ((p[0] & 0xE0) == 0xC0) { s++; continue; }
+        else if ((p[0] & 0xF0) == 0xE0) { s++; continue; }
+        else if ((p[0] & 0xF8) == 0xF0) { s++; continue; }
+        else { s++; continue; }
+        w += font_advance(cp);
+    }
+    return w;
+}
+
+/* -------- Cursor overlay -------- */
 
 static void cursor_restore_bg(void)
 {
-    if (!cursor_saved)
-        return;
+    if (!cursor_saved) return;
 
-    int32_t bytes = (int32_t)(tfb_bpp / 8);
     int32_t w = CURSOR_W;
     int32_t h = CURSOR_H;
-
-    if (cursor_x + w > (int32_t)tfb_w)
-        w = (int32_t)tfb_w - cursor_x;
-
-    if (cursor_y + h > (int32_t)tfb_h)
-        h = (int32_t)tfb_h - cursor_y;
+    if (cursor_x + w > (int32_t)fb_width())  w = (int32_t)fb_width()  - cursor_x;
+    if (cursor_y + h > (int32_t)fb_height()) h = (int32_t)fb_height() - cursor_y;
 
     if (w > 0 && h > 0) {
         for (int32_t j = 0; j < h; j++) {
-            uint8_t *dst = tfb_base
-                + (uint64_t)(cursor_y + j) * tfb_pitch
-                + (uint64_t)cursor_x * bytes;
-
-            memcpy(
-                dst,
-                cursor_bg + (uint64_t)j * CURSOR_W * bytes,
-                (size_t)w * bytes
-            );
+            for (int32_t i = 0; i < w; i++) {
+                fb_putpixel((int)(cursor_x + i), (int)(cursor_y + j),
+                            cursor_bg[j * CURSOR_W + i]);
+            }
         }
     }
-
     cursor_saved = 0;
 }
 
@@ -229,98 +156,64 @@ static void draw_cursor(void)
 
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-
-    if (x >= (int32_t)tfb_w)
-        x = (int32_t)tfb_w - 1;
-
-    if (y >= (int32_t)tfb_h)
-        y = (int32_t)tfb_h - 1;
+    if (x >= (int32_t)fb_width())  x = (int32_t)fb_width()  - 1;
+    if (y >= (int32_t)fb_height()) y = (int32_t)fb_height() - 1;
 
     cursor_restore_bg();
 
-    int32_t bytes = (int32_t)(tfb_bpp / 8);
     int32_t w = CURSOR_W;
     int32_t h = CURSOR_H;
-
-    if (x + w > (int32_t)tfb_w)
-        w = (int32_t)tfb_w - x;
-
-    if (y + h > (int32_t)tfb_h)
-        h = (int32_t)tfb_h - y;
-
-    if (w <= 0 || h <= 0)
-        return;
+    if (x + w > (int32_t)fb_width())  w = (int32_t)fb_width()  - x;
+    if (y + h > (int32_t)fb_height()) h = (int32_t)fb_height() - y;
+    if (w <= 0 || h <= 0) return;
 
     for (int32_t j = 0; j < h; j++) {
-        uint8_t *src = tfb_base
-            + (uint64_t)(y + j) * tfb_pitch
-            + (uint64_t)x * bytes;
-
-        memcpy(
-            cursor_bg + (uint64_t)j * CURSOR_W * bytes,
-            src,
-            (size_t)w * bytes
-        );
+        for (int32_t i = 0; i < w; i++) {
+            cursor_bg[j * CURSOR_W + i] = fb_getpixel((int)(x + i), (int)(y + j));
+        }
     }
 
     cursor_saved = 1;
     cursor_x = x;
     cursor_y = y;
 
-    uint32_t white = rgb(255, 255, 255);
-    uint32_t black = rgb(0, 0, 0);
+    uint32_t white = 0x00FFFFFF;
+    uint32_t black = 0x00000000;
 
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++) {
             char c = arrow[j][i];
-
-            if (c == 'X')
-                put_px(x + i, y + j, black);
-            else if (c == '.')
-                put_px(x + i, y + j, white);
+            if (c == 'X') fb_putpixel((int)(x + i), (int)(y + j), black);
+            else if (c == '.') fb_putpixel((int)(x + i), (int)(y + j), white);
         }
     }
 }
 
+/* -------- Window background save/restore -------- */
+
 static void save_background(void)
 {
-    if (!saved_bg)
-        return;
-
-    int32_t bytes = (int32_t)(tfb_bpp / 8);
+    if (!saved_bg) return;
 
     for (int32_t j = 0; j < win_h; j++) {
-        uint8_t *src = tfb_base
-            + (uint64_t)(win_y + j) * tfb_pitch
-            + (uint64_t)win_x * bytes;
-
-        memcpy(
-            saved_bg + (uint64_t)j * win_w * bytes,
-            src,
-            (size_t)win_w * bytes
-        );
+        for (int32_t i = 0; i < win_w; i++) {
+            saved_bg[j * win_w + i] = fb_getpixel((int)(win_x + i), (int)(win_y + j));
+        }
     }
 }
 
 static void restore_background(void)
 {
-    if (!saved_bg)
-        return;
-
-    int32_t bytes = (int32_t)(tfb_bpp / 8);
+    if (!saved_bg) return;
 
     for (int32_t j = 0; j < win_h; j++) {
-        uint8_t *dst = tfb_base
-            + (uint64_t)(win_y + j) * tfb_pitch
-            + (uint64_t)win_x * bytes;
-
-        memcpy(
-            dst,
-            saved_bg + (uint64_t)j * win_w * bytes,
-            (size_t)win_w * bytes
-        );
+        for (int32_t i = 0; i < win_w; i++) {
+            fb_putpixel((int)(win_x + i), (int)(win_y + j), saved_bg[j * win_w + i]);
+        }
     }
 }
+
+/* -------- Layout -------- */
 
 static int visible_lines(void)
 {
@@ -329,53 +222,46 @@ static int visible_lines(void)
 
 static int max_input_cols(void)
 {
-    int cols = (win_w - 2 * PAD) / CW
-             - (int)strlen(PROMPT) - 1;
-
-    if (cols > LINE_MAX - 1)
-        cols = LINE_MAX - 1;
-
+    int cols = (win_w - 2 * PAD) / CW - (int)strlen(PROMPT) - 1;
+    if (cols > LINE_MAX - 1) cols = LINE_MAX - 1;
     return cols < 1 ? 1 : cols;
 }
 
-static void prompt_pos(int32_t *px, int32_t *py)
+static void prompt_pos(int32_t *px, int32_t *py_baseline)
 {
     int vis = visible_lines();
-    int n_show = line_count < vis - 1
-               ? line_count
-               : vis - 1;
+    int n_show = line_count < vis - 1 ? line_count : vis - 1;
+    if (n_show < 0) n_show = 0;
 
-    if (n_show < 0)
-        n_show = 0;
+    int prompt_w = text_width(PROMPT);
+    int input_w  = 0;
+    for (int i = 0; i < input_len; i++) {
+        input_w += font_advance((unsigned char)input_buf[i]);
+    }
 
-    *px = win_x + PAD
-        + ((int32_t)strlen(PROMPT) + input_len) * CW;
-
-    *py = win_y + TITLE_H + PAD + n_show * LINE_H;
+    *px = win_x + PAD + prompt_w + input_w;
+    *py_baseline = win_y + TITLE_H + PAD + n_show * LINE_H + font_ascent();
 }
 
 static void draw_caret(void)
 {
-    int32_t cx, cy;
+    int32_t cx, cy_baseline;
+    prompt_pos(&cx, &cy_baseline);
+    int top = cy_baseline - font_ascent();
 
-    prompt_pos(&cx, &cy);
-
-    fill_rect(
-        cx,
-        cy,
-        2,
-        CH,
-        caret_on ? rgb(200, 230, 200) : rgb(22, 24, 32)
-    );
+    fill_rect(cx, top, 2, CH,
+              caret_on ? 0x00C8E6C8 : 0x00161820);
 }
+
+/* -------- Window drawing -------- */
 
 static void draw_window(void)
 {
-    uint32_t bg      = rgb(22, 24, 32);
-    uint32_t border  = rgb(70, 80, 110);
-    uint32_t title   = rgb(45, 50, 70);
-    uint32_t text    = rgb(220, 220, 220);
-    uint32_t title_t = rgb(200, 210, 240);
+    uint32_t bg      = 0x00161820;
+    uint32_t border  = 0x0046506E;
+    uint32_t title   = 0x002D3246;
+    uint32_t text    = 0x00DCDCDC;
+    uint32_t title_t = 0x00C8D2F0;
 
     int32_t max_x = win_x + win_w - PAD;
 
@@ -385,72 +271,35 @@ static void draw_window(void)
     fill_rect(win_x, win_y, 2, win_h, border);
     fill_rect(win_x + win_w - 2, win_y, 2, win_h, border);
 
-    fill_rect(
-        win_x + 2,
-        win_y + 2,
-        win_w - 4,
-        TITLE_H - 2,
-        title
-    );
+    fill_rect(win_x + 2, win_y + 2, win_w - 4, TITLE_H - 2, title);
 
     int32_t dot_y = win_y + 2 + (TITLE_H - 2 - 10) / 2;
+    fill_rect(win_x + PAD,      dot_y, 10, 10, 0x00EB5F5A);
+    fill_rect(win_x + PAD + 16, dot_y, 10, 10, 0x00F0BE46);
+    fill_rect(win_x + PAD + 32, dot_y, 10, 10, 0x005AC864);
 
-    fill_rect(win_x + PAD,      dot_y, 10, 10, rgb(235, 95, 90));
-    fill_rect(win_x + PAD + 16, dot_y, 10, 10, rgb(240, 190, 70));
-    fill_rect(win_x + PAD + 32, dot_y, 10, 10, rgb(90, 200, 100));
-
-    draw_text(
-        win_x + PAD + 56,
-        win_y + 2 + (TITLE_H - 2 - CH) / 2,
-        "Lethal Terminal",
-        title_t,
-        max_x
-    );
+    int title_baseline = win_y + 2 + (TITLE_H - 2) / 2 + font_ascent() / 2 - 2;
+    draw_text(win_x + PAD + 56, title_baseline,
+              "Lethal Terminal", title_t, max_x);
 
     int vis = visible_lines();
-    int n_show = line_count < vis - 1
-               ? line_count
-               : vis - 1;
-
-    if (n_show < 0)
-        n_show = 0;
+    int n_show = line_count < vis - 1 ? line_count : vis - 1;
+    if (n_show < 0) n_show = 0;
 
     int start = line_count - n_show;
-    int32_t ty = win_y + TITLE_H + PAD;
+    int32_t ty_baseline = win_y + TITLE_H + PAD + font_ascent();
 
     for (int i = 0; i < n_show; i++) {
-        draw_text(
-            win_x + PAD,
-            ty,
-            lines[start + i],
-            text,
-            max_x
-        );
-
-        ty += LINE_H;
+        draw_text(win_x + PAD, ty_baseline, lines[start + i], text, max_x);
+        ty_baseline += LINE_H;
     }
 
-    int32_t px = win_x + PAD;
+    draw_text(win_x + PAD, ty_baseline, PROMPT, 0x0078E696, max_x);
 
-    draw_text(
-        px,
-        ty,
-        PROMPT,
-        rgb(120, 230, 150),
-        max_x
-    );
-
-    px += (int32_t)strlen(PROMPT) * CW;
-
+    int32_t px = win_x + PAD + text_width(PROMPT);
     input_buf[input_len] = '\0';
 
-    draw_text(
-        px,
-        ty,
-        input_buf,
-        rgb(235, 235, 235),
-        max_x
-    );
+    draw_text(px, ty_baseline, input_buf, 0x00EBEBEB, max_x);
 
     draw_caret();
 }
@@ -462,43 +311,23 @@ static void refresh_window(void)
     draw_cursor();
 }
 
+/* -------- Public API -------- */
+
 void terminal_set_fb(const struct framebuffer_info *info)
 {
-    if (!info || info->addr == 0)
+    if (!info || info->addr == 0) return;
+
+    if (fb_width() == 0 || fb_height() == 0) {
+        serial_print("[term] framebuffer not ready\n");
         return;
-
-    tfb_base = (uint8_t *)(uintptr_t)info->addr;
-
-    tfb_w     = info->width;
-    tfb_h     = info->height;
-    tfb_pitch = info->pitch;
-    tfb_bpp   = info->bpp;
-
-    rpos = info->red_pos;
-    rsz  = info->red_mask;
-
-    gpos = info->green_pos;
-    gsz  = info->green_mask;
-
-    bpos = info->blue_pos;
-    bsz  = info->blue_mask;
-
-    if (rsz == 0 || rsz > 8) {
-        rpos = 16;
-        rsz  = 8;
-        gpos = 8;
-        gsz  = 8;
-        bpos = 0;
-        bsz  = 8;
     }
 
     tfb_ok = 1;
-
     serial_print("[term] fb=");
-    serial_print_dec(tfb_w);
+    serial_print_dec(fb_width());
     serial_print("x");
-    serial_print_dec(tfb_h);
-    serial_print(" font=bitmap\n");
+    serial_print_dec(fb_height());
+    serial_print(" font=ttf\n");
 }
 
 static void add_line(const char *s)
@@ -518,20 +347,16 @@ static void add_line(const char *s)
 
 void terminal_run(void)
 {
-    if (!tfb_ok)
-        return;
+    if (!tfb_ok) return;
 
     win_w = WIN_DEFAULT_W;
     win_h = WIN_DEFAULT_H;
 
-    if (win_w > (int32_t)tfb_w)
-        win_w = (int32_t)tfb_w;
+    if (win_w > (int32_t)fb_width())  win_w = (int32_t)fb_width();
+    if (win_h > (int32_t)fb_height()) win_h = (int32_t)fb_height();
 
-    if (win_h > (int32_t)tfb_h)
-        win_h = (int32_t)tfb_h;
-
-    win_x = ((int32_t)tfb_w - win_w) / 2;
-    win_y = ((int32_t)tfb_h - win_h) / 2;
+    win_x = ((int32_t)fb_width()  - win_w) / 2;
+    win_y = ((int32_t)fb_height() - win_h) / 2;
 
     line_count = 0;
     input_len = 0;
@@ -544,11 +369,9 @@ void terminal_run(void)
     last_buttons = 0;
     cursor_saved = 0;
 
-    saved_bg = (uint8_t *)kmalloc(
-        (uint64_t)win_w * win_h * (tfb_bpp / 8)
-    );
+    saved_bg = (uint32_t *)kmalloc((uint64_t)win_w * win_h * sizeof(uint32_t));
 
-    add_line("Lethal Kernel terminal v1.0");
+    add_line("Lethal Kernel terminal v1.0 (TrueType)");
     add_line("Type 'help' for commands, or 'exit' (or ESC) to quit.");
     add_line("");
 
@@ -584,84 +407,57 @@ void terminal_run(void)
             }
         }
 
-        if (!(btns & 1))
-            dragging = 0;
-
+        if (!(btns & 1)) dragging = 0;
         last_buttons = btns;
 
         if (dragging) {
             int32_t nx = cx - drag_off_x;
             int32_t ny = cy - drag_off_y;
 
-            if (nx < 0)
-                nx = 0;
-
-            if (ny < 0)
-                ny = 0;
-
-            if (nx + win_w > (int32_t)tfb_w)
-                nx = (int32_t)tfb_w - win_w;
-
-            if (ny + win_h > (int32_t)tfb_h)
-                ny = (int32_t)tfb_h - win_h;
+            if (nx < 0) nx = 0;
+            if (ny < 0) ny = 0;
+            if (nx + win_w > (int32_t)fb_width())  nx = (int32_t)fb_width()  - win_w;
+            if (ny + win_h > (int32_t)fb_height()) ny = (int32_t)fb_height() - win_h;
 
             if (nx != win_x || ny != win_y) {
                 cursor_restore_bg();
                 restore_background();
-
                 win_x = nx;
                 win_y = ny;
-
                 save_background();
                 draw_window();
-
                 need_cursor = 1;
             }
         }
 
-        if (need_cursor)
-            draw_cursor();
+        if (need_cursor) draw_cursor();
 
         if ((++blink % 200) == 0) {
             caret_on = !caret_on;
-
             cursor_restore_bg();
             draw_caret();
             draw_cursor();
         }
 
         char c;
-
         if (!keyboard_getchar(&c)) {
-            for (volatile int i = 0; i < 1000; i++)
-                __asm__ volatile("pause");
-
+            for (volatile int i = 0; i < 1000; i++) __asm__ volatile("pause");
             continue;
         }
 
-        if ((uint8_t)c == KEY_ESC)
-            break;
+        if ((uint8_t)c == KEY_ESC) break;
 
         if (c == '\n' || c == '\r') {
             char full[LINE_MAX + 16];
             int n = 0;
-
-            while (PROMPT[n]) {
-                full[n] = PROMPT[n];
-                n++;
-            }
-
-            for (int i = 0; i < input_len; i++)
-                full[n++] = input_buf[i];
-
+            while (PROMPT[n]) { full[n] = PROMPT[n]; n++; }
+            for (int i = 0; i < input_len; i++) full[n++] = input_buf[i];
             full[n] = '\0';
 
             add_line(full);
-
             input_buf[input_len] = '\0';
 
-            if (strcmp(input_buf, "exit") == 0)
-                break;
+            if (strcmp(input_buf, "exit") == 0) break;
 
             if (strcmp(input_buf, "help") == 0) {
                 add_line("  help         - display available commands");
@@ -674,16 +470,13 @@ void terminal_run(void)
                 add_line(input_buf + 5);
             } else if (input_len > 0) {
                 char err[LINE_MAX + 32];
-
                 strcpy(err, "Unknown command: ");
                 strcat(err, input_buf);
-
                 add_line(err);
             }
 
             input_len = 0;
             caret_on = 1;
-
             refresh_window();
             continue;
         }
@@ -692,18 +485,14 @@ void terminal_run(void)
             if (input_len > 0) {
                 input_len--;
                 caret_on = 1;
-
                 refresh_window();
             }
-
             continue;
         }
 
-        if (c >= 32 && c < 127 &&
-            input_len < max_input_cols()) {
+        if (c >= 32 && c < 127 && input_len < max_input_cols()) {
             input_buf[input_len++] = c;
             caret_on = 1;
-
             refresh_window();
         }
     }

@@ -150,7 +150,10 @@ $(BUILD)/kernel.elf: $(KOBJS) linker.ld
 # ----------------------------------------------------------------------------
 # Userspace + FAT16
 # ----------------------------------------------------------------------------
-USER_BINS := $(BUILD)/user/init.bin $(BUILD)/user/ipc_test.bin
+USER_BINS := $(BUILD)/user/init.bin \
+             $(BUILD)/user/ipc_test.bin \
+             $(BUILD)/user/sltest.bin \
+             $(BUILD)/user/idle.bin
 
 $(BUILD)/user/init.bin: user/init.asm user/lib.asm
 	@mkdir -p $(dir $@)
@@ -160,12 +163,22 @@ $(BUILD)/user/ipc_test.bin: user/ipc_test.asm user/lib.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f bin -I user/ $< -o $@
 
+$(BUILD)/user/sltest.bin: user/sltest.asm user/lib.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f bin -I user/ $< -o $@
+
+$(BUILD)/user/idle.bin: user/idle.asm user/lib.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f bin -I user/ $< -o $@
+
 fsimage: $(USER_BINS) $(FAT_TOOL) $(FONT_FILE)
 	@mkdir -p $(BUILD)
 	@echo "Creating FAT16 image..."
 	$(PYTHON) $(FAT_TOOL) $(FS_IMAGE) \
 		$(BUILD)/user/init.bin \
 		$(BUILD)/user/ipc_test.bin \
+		$(BUILD)/user/sltest.bin \
+		$(BUILD)/user/idle.bin \
 		$(FONT_FILE)
 
 # ----------------------------------------------------------------------------
